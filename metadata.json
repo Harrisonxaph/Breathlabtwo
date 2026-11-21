@@ -1,0 +1,6 @@
+{
+  "name": "Cadence",
+  "description": "Guided breathwork studio for 1-40 rhythmic inhale/exhale cycles, adjustable breath holds, and recovery breathing with live organic visuals.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
