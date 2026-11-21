@@ -2,13 +2,72 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import fs from 'fs';
 import path from 'path';
-import {defineConfig} from 'vite';
+import { defineConfig } from 'vite';
+import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig(() => {
   return {
     plugins: [
       react(),
       tailwindcss(),
+      VitePWA({
+        registerType: 'autoUpdate',
+        manifest: {
+          name: 'BREATHFLOW',
+          short_name: 'BREATHFLOW',
+          description:
+            'Guided breathwork studio for rhythmic breathing, holds, recovery, and offline voice guidance.',
+          id: '/',
+          start_url: '/',
+          scope: '/',
+          display: 'standalone',
+          orientation: 'portrait-primary',
+          theme_color: '#0B1117',
+          background_color: '#0B1117',
+          categories: ['health', 'lifestyle', 'wellness'],
+          icons: [
+            {
+              src: 'pwa-192x192.png',
+              sizes: '192x192',
+              type: 'image/png',
+            },
+            {
+              src: 'pwa-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+            },
+            {
+              src: 'pwa-maskable-512x512.png',
+              sizes: '512x512',
+              type: 'image/png',
+              purpose: 'maskable',
+            },
+          ],
+        },
+        workbox: {
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2,mp3}'],
+          maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
+          cleanupOutdatedCaches: true,
+          navigateFallback: '/index.html',
+          runtimeCaching: [
+            {
+              urlPattern: ({ url }) => url.pathname.startsWith('/assets/aistudio/'),
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'breathflow-audio-pack',
+                expiration: {
+                  maxEntries: 64,
+                  maxAgeSeconds: 60 * 60 * 24 * 365,
+                },
+              },
+            },
+          ],
+        },
+        devOptions: {
+          enabled: true,
+          type: 'module',
+        },
+      }),
       // Copies src/assets into dist/ so root-relative URLs like
       // "/src/assets/images/..." (e.g. generate_image output) still resolve
       // in production builds. Do not remove.
@@ -23,7 +82,7 @@ export default defineConfig(() => {
           const srcAssets = path.resolve(__dirname, 'src/assets');
           const distAssets = path.resolve(distDir, 'src/assets');
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
-            fs.cpSync(srcAssets, distAssets, {recursive: true, force: true});
+            fs.cpSync(srcAssets, distAssets, { recursive: true, force: true });
           }
         },
       },

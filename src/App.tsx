@@ -8,25 +8,50 @@ import { User } from 'firebase/auth';
 import { BreathVisualizer } from './components/BreathVisualizer';
 import { DriveVoicePanel } from './components/DriveVoicePanel';
 import { ProtocolControls } from './components/ProtocolControls';
-import { SessionHistoryAndGuide } from './components/SessionHistoryAndGuide';
+import { PWAInstallControl } from './components/PWAInstallBanner';
+import { SafetyAndGuide } from './components/SafetyAndGuide';
+import { SafetyReminderModal } from './components/SafetyReminderModal';
 import {
   BREATH_PRESETS,
   BreathConfig,
   BreathPreset,
   BreathSessionState,
   DEFAULT_CONFIG,
-  SessionRecord,
+  InterruptionReason,
   createInitialState,
-  extendHold,
+  endSessionEarly,
+  getPhaseProgress,
+  pauseForInterruption,
+  resumeFromPause,
   skipToNextPhase,
   startSession,
   stepSession,
 } from './utils/breathEngine';
-import { AudioMode, breathAudio } from './utils/breathAudio';
+import {
+  AudioMode,
+  AudioReadinessReport,
+  AudioVolumeSettings,
+  NarrationLevel,
+  SoundscapeId,
+  breathAudio,
+} from './utils/breathAudio';
 import {
   evaluateProgressAudioUpdate,
   getTransitionSpeechText,
 } from './utils/breathCoaching';
+import {
+  createCustomPreset,
+  loadAudioPreferences,
+  loadCustomPresets,
+  loadInterfacePreferences,
+  loadLastConfig,
+  purgeLegacySessionHistory,
+  saveAudioPreferences,
+  saveCustomPresets,
+  saveInterfacePreferences,
+  saveLastConfig,
+} from './utils/sessionPreferences';
+import { acquireWakeLock, releaseWakeLock } from './utils/wakeLock';
 import {
   clearAudioCache,
   loadAllCachedClips,
@@ -61,42 +86,48 @@ import {
   logout,
 } from './utils/googleAuth';
 
-const HISTORY_STORAGE_KEY = 'cadence.breathwork.history.v1';
-
-function loadHistory(): SessionRecord[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const raw = window.localStorage.getItem(HISTORY_STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed.slice(0, 20) : [];
-  } catch {
-    return [];
-  }
-}
-
-function saveHistory(records: SessionRecord[]): void {
-  if (typeof window === 'undefined') return;
-  try {
-    window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(records.slice(0, 20)));
-  } catch {
-    // Ignore storage quota errors
-  }
+function configsEqual(a: BreathConfig, b: BreathConfig): boolean {
+  return (
+    a.breathCount === b.breathCount &&
+    a.inhaleSec === b.inhaleSec &&
+    a.exhaleSec === b.exhaleSec &&
+    a.holdSec === b.holdSec &&
+    a.recoveryInhaleSec === b.recoveryInhaleSec &&
+    a.recoveryHoldSec === b.recoveryHoldSec &&
+    a.rounds === b.rounds &&
+    a.prepCountdownSec === b.prepCountdownSec &&
+    a.useRoundSpecificHolds === b.useRoundSpecificHolds &&
+    a.roundRetentionCues === b.roundRetentionCues &&
+    a.roundHoldOverrides.slice(0, a.rounds).join(',') ===
+      b.roundHoldOverrides.slice(0, b.rounds).join(',')
+  );
 }
 
 export default function App() {
-  const [config, setConfig] = useState<BreathConfig>(DEFAULT_CONFIG);
-  const [activePresetId, setActivePresetId] = useState<string | null>(BREATH_PRESETS[0].id);
-  const [syncInhaleExhale, setSyncInhaleExhale] = useState<boolean>(true);
-  const [audioEnabled, setAudioEnabled] = useState<boolean>(true);
-  const [audioMode, setAudioMode] = useState<AudioMode>('voice_and_chimes');
-  const [speechFallbackEnabled, setSpeechFallbackEnabled] = useState<boolean>(true);
-  const [progressUpdatesEnabled, setProgressUpdatesEnabled] = useState<boolean>(true);
-  const [audioUpdateCaption, setAudioUpdateCaption] = useState<string | null>(null);
-  const [session, setSession] = useState<BreathSessionState>(() =>
-    createInitialState(DEFAULT_CONFIG)
+  const [config, setConfig] = useState<BreathConfig>(() => loadLastConfig() ?? DEFAULT_CONFIG);
+  const [customPresets, setCustomPresets] = useState<BreathPreset[]>(() => loadCustomPresets());
+  const [activePresetId, setActivePresetId] = useState<string | null>(() => {
+    const initial = loadLastConfig() ?? DEFAULT_CONFIG;
+    const all = [...BREATH_PRESETS, ...loadCustomPresets()];
+    return all.find((p) => configsEqual(p.config, initial))?.id ?? null;
+  });
+  const [syncInhaleExhale, setSyncInhaleExhale] = useState<boolean>(
+    () => config.inhaleSec === config.exhaleSec
   );
-  const [history, setHistory] = useState<SessionRecord[]>(() => loadHistory());
+
+  // Audio & interface preferences (stored locally; no session history or hold records)
+  const [audioPrefs, setAudioPrefs] = useState(() => loadAudioPreferences());
+  const [interfacePrefs, setInterfacePrefs] = useState(() => loadInterfacePreferences());
+  const [osReducedMotion, setOsReducedMotion] = useState<boolean>(() =>
+    typeof window !== 'undefined' && window.matchMedia
+      ? window.matchMedia('(prefers-reduced-motion: reduce)').matches
+      : false
+  );
+  const [audioUpdateCaption, setAudioUpdateCaption] = useState<string | null>(null);
+  const [session, setSession] = useState<BreathSessionState>(() => createInitialState(config));
+  const [showSafetyModal, setShowSafetyModal] = useState<boolean>(false);
+  const [isFocusMode, setIsFocusMode] = useState<boolean>(false);
+  const [wakeLockActive, setWakeLockActive] = useState<boolean>(false);
 
   // Google Drive Auth & TTS Audio state (initialized synchronously with 45 bundled BREATHFLOW clips)
   const [user, setUser] = useState<User | null>(null);
@@ -130,14 +161,17 @@ export default function App() {
     breathAudio.setVoicePools(getBuiltinVoicePools());
     return initial;
   });
+  const [readinessReport, setReadinessReport] = useState<AudioReadinessReport>(() =>
+    breathAudio.getReadinessReport()
+  );
   const [loadingFileIds, setLoadingFileIds] = useState<Record<string, boolean>>({});
   const [previewingFileId, setPreviewingFileId] = useState<string | null>(null);
 
   const sessionRef = useRef<BreathSessionState>(session);
-  const recordedCompletionRef = useRef<boolean>(false);
   const loadedClipIdsRef = useRef<Record<string, boolean>>(loadedClipIds);
   const emittedUpdatesRef = useRef<Set<string>>(new Set());
   const captionTimerRef = useRef<number | null>(null);
+  const soundscapePreviewTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     sessionRef.current = session;
@@ -147,57 +181,103 @@ export default function App() {
     loadedClipIdsRef.current = loadedClipIds;
   }, [loadedClipIds]);
 
-  const activateBuiltinAudioPack = useCallback(async (isCancelled?: () => boolean) => {
-    const builtinMap = getBuiltinPhaseMap();
-    const pools = getBuiltinVoicePools();
-
-    const readyMap: Record<string, boolean> = {};
-    BUILTIN_AUDIO_FILES.forEach((file) => {
-      if (file.localUrl) {
-        breathAudio.registerLocalUrl(file.id, file.localUrl);
-        readyMap[file.id] = true;
-      }
-    });
-
-    if (isCancelled?.()) return;
-
-    breathAudio.setVoicePools(pools);
-    setDiscoveredFiles(BUILTIN_AUDIO_FILES);
-    setPhaseMap(builtinMap);
-    setCountClips({});
-    setSourceLabel('Built-in BREATHFLOW Voice Pack');
-    setFolderFound(true);
-    loadedClipIdsRef.current = readyMap;
-    setLoadedClipIds(readyMap);
-
-    // Pre-fetch & decode bundled MP3s in smooth batches so Web Audio playback is zero-latency
-    const batchSize = 9;
-    for (let i = 0; i < BUILTIN_AUDIO_FILES.length; i += batchSize) {
-      if (isCancelled?.()) return;
-      const batch = BUILTIN_AUDIO_FILES.slice(i, i + batchSize);
-      await Promise.all(
-        batch.map(async (file) => {
-          if (!file.localUrl) return;
-          try {
-            const res = await fetch(file.localUrl);
-            if (res.ok) {
-              const buffer = await res.arrayBuffer();
-              await breathAudio.registerAudioBuffer(file.id, buffer);
-            }
-          } catch {
-            // Fallback HTMLAudioElement local URL stays available
-          }
-        })
-      );
-    }
+  // Privacy: purge any legacy session history or hold-duration keys on startup
+  useEffect(() => {
+    purgeLegacySessionHistory();
   }, []);
+
+  // Persist user configuration & preferences locally
+  useEffect(() => {
+    saveLastConfig(config);
+  }, [config]);
+
+  useEffect(() => {
+    saveCustomPresets(customPresets);
+  }, [customPresets]);
+
+  useEffect(() => {
+    saveAudioPreferences(audioPrefs);
+    breathAudio.setEnabled(audioPrefs.audioEnabled);
+    breathAudio.setMode(audioPrefs.audioMode);
+    breathAudio.setNarrationLevel(audioPrefs.narrationLevel);
+    breathAudio.setSoundscape(audioPrefs.soundscape);
+    breathAudio.setVolumes(audioPrefs.volumes);
+    breathAudio.setSpeechFallbackEnabled(audioPrefs.speechFallbackEnabled);
+    breathAudio.setProgressUpdatesEnabled(audioPrefs.narrationLevel !== 'minimal');
+  }, [audioPrefs]);
+
+  useEffect(() => {
+    saveInterfacePreferences(interfacePrefs);
+  }, [interfacePrefs]);
+
+  // Listen to system prefers-reduced-motion media query
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const update = () => setOsReducedMotion(mq.matches);
+    update();
+    mq.addEventListener('change', update);
+    return () => mq.removeEventListener('change', update);
+  }, []);
+
+  const refreshReadiness = useCallback(() => {
+    setReadinessReport(breathAudio.getReadinessReport());
+  }, []);
+
+  const activateBuiltinAudioPack = useCallback(
+    async (isCancelled?: () => boolean) => {
+      const builtinMap = getBuiltinPhaseMap();
+      const pools = getBuiltinVoicePools();
+
+      const readyMap: Record<string, boolean> = {};
+      BUILTIN_AUDIO_FILES.forEach((file) => {
+        if (file.localUrl) {
+          breathAudio.registerLocalUrl(file.id, file.localUrl);
+          readyMap[file.id] = true;
+        }
+      });
+
+      if (isCancelled?.()) return;
+
+      breathAudio.setVoicePools(pools);
+      setDiscoveredFiles(BUILTIN_AUDIO_FILES);
+      setPhaseMap(builtinMap);
+      setCountClips({});
+      setSourceLabel('Built-in BREATHFLOW Voice Pack');
+      setFolderFound(true);
+      loadedClipIdsRef.current = readyMap;
+      setLoadedClipIds(readyMap);
+
+      const batchSize = 9;
+      for (let i = 0; i < BUILTIN_AUDIO_FILES.length; i += batchSize) {
+        if (isCancelled?.()) return;
+        const batch = BUILTIN_AUDIO_FILES.slice(i, i + batchSize);
+        await Promise.all(
+          batch.map(async (file) => {
+            if (!file.localUrl) return;
+            try {
+              const res = await fetch(file.localUrl);
+              if (res.ok) {
+                const buffer = await res.arrayBuffer();
+                await breathAudio.registerAudioBuffer(file.id, buffer);
+              }
+            } catch {
+              // Fallback HTMLAudioElement local URL stays available
+            }
+          })
+        );
+      }
+      if (!isCancelled?.()) refreshReadiness();
+    },
+    [refreshReadiness]
+  );
 
   // Wire playback error surface and unlock Web Audio on first user interaction
   useEffect(() => {
     breathAudio.setOnPlaybackError((msg) => setDriveError(msg));
 
     const unlockOnGesture = () => {
-      void breathAudio.unlock();
+      void breathAudio.unlock().then(refreshReadiness);
     };
     window.addEventListener('pointerdown', unlockOnGesture, {
       capture: true,
@@ -215,7 +295,7 @@ export default function App() {
       window.removeEventListener('pointerdown', unlockOnGesture, { capture: true });
       window.removeEventListener('keydown', unlockOnGesture, { capture: true });
     };
-  }, []);
+  }, [refreshReadiness]);
 
   // Pre-fetch bundled BREATHFLOW MP3s concurrently while checking IndexedDB for custom Drive clips
   useEffect(() => {
@@ -242,6 +322,7 @@ export default function App() {
           })
         );
       }
+      if (!cancelled) refreshReadiness();
     };
 
     void prefetchBuiltinBuffers();
@@ -303,12 +384,13 @@ export default function App() {
       setFolderFound(true);
       loadedClipIdsRef.current = loadedMap;
       setLoadedClipIds(loadedMap);
+      refreshReadiness();
     })();
 
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [refreshReadiness]);
 
   // Initialize Firebase Auth listener
   useEffect(() => {
@@ -513,7 +595,6 @@ export default function App() {
           discovery.sourceLabel
         );
 
-        // Pre-fetch matched clips (plus up to 20 discovered clips so all phase swaps play instantly)
         const matchedFiles = [
           ...Object.values(matched.phaseMap).filter((f): f is DriveAudioFile => Boolean(f)),
           ...Object.values(matched.countClips),
@@ -525,13 +606,14 @@ export default function App() {
         if (preloadSet.size > 0) {
           await ensureFilesLoaded(Array.from(preloadSet.values()), token);
         }
+        refreshReadiness();
       } catch (err) {
         handleDriveAuthFailure(err);
       } finally {
         setIsLoadingDrive(false);
       }
     },
-    [ensureFilesLoaded, handleDriveAuthFailure, persistVoiceSnapshot]
+    [ensureFilesLoaded, handleDriveAuthFailure, persistVoiceSnapshot, refreshReadiness]
   );
 
   const handleSignIn = useCallback(async () => {
@@ -684,16 +766,18 @@ export default function App() {
     setPreviewingFileId(null);
   }, []);
 
-  const handleTestAudio = useCallback(async () => {
+  const handleRunAudioCheck = useCallback(async () => {
     setDriveError(null);
     try {
-      await breathAudio.testAudioOutput();
+      const report = await breathAudio.runAudioReadinessCheck();
+      setReadinessReport(report);
     } catch (err) {
       setDriveError(
         err instanceof Error ? err.message : 'Browser audio output is muted or blocked.'
       );
+      refreshReadiness();
     }
-  }, []);
+  }, [refreshReadiness]);
 
   const handlePlayBriefing = useCallback(async (kind: 'welcome' | 'safety') => {
     setDriveError(null);
@@ -707,8 +791,67 @@ export default function App() {
   }, []);
 
   const handleChangeAudioMode = useCallback((mode: AudioMode) => {
-    setAudioMode(mode);
-    breathAudio.setMode(mode);
+    setAudioPrefs((prev) => ({ ...prev, audioMode: mode }));
+  }, []);
+
+  const handleChangeNarrationLevel = useCallback((narrationLevel: NarrationLevel) => {
+    setAudioPrefs((prev) => ({ ...prev, narrationLevel }));
+  }, []);
+
+  const clearSoundscapePreviewTimer = useCallback(() => {
+    if (soundscapePreviewTimerRef.current !== null) {
+      window.clearTimeout(soundscapePreviewTimerRef.current);
+      soundscapePreviewTimerRef.current = null;
+    }
+  }, []);
+
+  const handleChangeSoundscape = useCallback(
+    (soundscape: SoundscapeId) => {
+      clearSoundscapePreviewTimer();
+      setAudioPrefs((prev) => ({ ...prev, soundscape }));
+      breathAudio.setSoundscape(soundscape);
+    },
+    [clearSoundscapePreviewTimer]
+  );
+
+  const handlePreviewSoundscape = useCallback(() => {
+    clearSoundscapePreviewTimer();
+    void breathAudio.previewSoundscapeBriefly();
+    soundscapePreviewTimerRef.current = window.setTimeout(() => {
+      soundscapePreviewTimerRef.current = null;
+      if (
+        sessionRef.current.phase === 'idle' ||
+        sessionRef.current.phase === 'completed' ||
+        sessionRef.current.isPaused
+      ) {
+        breathAudio.stopAmbient();
+      }
+    }, 3500);
+  }, [clearSoundscapePreviewTimer]);
+
+  const handleChangeVolumes = useCallback((next: Partial<AudioVolumeSettings>) => {
+    setAudioPrefs((prev) => ({
+      ...prev,
+      volumes: {
+        ...prev.volumes,
+        ...next,
+      },
+    }));
+  }, []);
+
+  const handleToggleSpeechFallback = useCallback(() => {
+    setAudioPrefs((prev) => ({ ...prev, speechFallbackEnabled: !prev.speechFallbackEnabled }));
+  }, []);
+
+  const handleToggleReducedMotion = useCallback(() => {
+    setInterfacePrefs((prev) => ({
+      ...prev,
+      reducedMotionOverride: !prev.reducedMotionOverride,
+    }));
+  }, []);
+
+  const handleToggleAutoFocusMode = useCallback(() => {
+    setInterfacePrefs((prev) => ({ ...prev, autoFocusMode: !prev.autoFocusMode }));
   }, []);
 
   const showAudioCaption = useCallback((text: string) => {
@@ -727,73 +870,97 @@ export default function App() {
       if (captionTimerRef.current !== null) {
         window.clearTimeout(captionTimerRef.current);
       }
+      if (soundscapePreviewTimerRef.current !== null) {
+        window.clearTimeout(soundscapePreviewTimerRef.current);
+      }
     };
-  }, []);
-
-  const handleToggleSpeechFallback = useCallback(() => {
-    setSpeechFallbackEnabled((prev) => {
-      const next = !prev;
-      breathAudio.setSpeechFallbackEnabled(next);
-      return next;
-    });
-  }, []);
-
-  const handleToggleProgressUpdates = useCallback(() => {
-    setProgressUpdatesEnabled((prev) => {
-      const next = !prev;
-      breathAudio.setProgressUpdatesEnabled(next);
-      if (!next) setAudioUpdateCaption(null);
-      return next;
-    });
   }, []);
 
   const isRunning = session.phase !== 'idle' && session.phase !== 'completed';
 
-  const recordCompletedSession = useCallback(
-    (completed: BreathSessionState) => {
-      if (recordedCompletionRef.current) return;
-      recordedCompletionRef.current = true;
+  // Screen Wake Lock & Ambient audio lifecycle synced with active, unpaused sessions
+  useEffect(() => {
+    const activeUnpaused = isRunning && !session.isPaused;
+    breathAudio.setSessionRunning(activeUnpaused);
 
-      const presetName =
-        BREATH_PRESETS.find((p) => p.id === activePresetId)?.name ?? 'Custom Cadence';
-
-      const newRecord: SessionRecord = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-        timestamp: Date.now(),
-        presetName,
-        breathsPerRound: completed.config.breathCount,
-        roundsCompleted: completed.config.rounds,
-        totalBreaths: completed.totalBreathsCompleted,
-        holdLengthsSec: completed.holdDurationsAchievedSec,
-        recoveryHoldSec: completed.config.recoveryHoldSec,
-        totalDurationSec: Math.round(completed.totalElapsedMs / 1000),
-      };
-
-      setHistory((prev) => {
-        const next = [newRecord, ...prev].slice(0, 20);
-        saveHistory(next);
-        return next;
+    if (activeUnpaused) {
+      void acquireWakeLock().then((acquired) => {
+        setWakeLockActive(acquired);
       });
-    },
-    [activePresetId]
-  );
+    } else {
+      void releaseWakeLock().then(() => {
+        setWakeLockActive(false);
+      });
+    }
+  }, [isRunning, session.isPaused]);
 
-  // Precision timing loop for active breathwork session
+  useEffect(() => {
+    return () => {
+      void releaseWakeLock();
+      breathAudio.setSessionRunning(false);
+    };
+  }, []);
+
+  // Auto-pause on screen lock, app switching, or audio interruption
+  const triggerInterruptionPause = useCallback((reason: InterruptionReason) => {
+    const current = sessionRef.current;
+    if (current.phase === 'idle' || current.phase === 'completed' || current.isPaused) {
+      return;
+    }
+    breathAudio.stopActiveVoice();
+    breathAudio.stopSpeech();
+    breathAudio.setSessionRunning(false);
+    void releaseWakeLock().then(() => setWakeLockActive(false));
+
+    const paused = pauseForInterruption(current, reason);
+    sessionRef.current = paused;
+    setSession(paused);
+  }, []);
+
+  useEffect(() => {
+    breathAudio.setOnAudioInterruption(() => {
+      triggerInterruptionPause('audio_interrupted');
+    });
+
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        triggerInterruptionPause('backgrounded');
+      }
+    };
+
+    const handlePageHide = () => {
+      triggerInterruptionPause('backgrounded');
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
+
+    return () => {
+      breathAudio.setOnAudioInterruption(null);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
+    };
+  }, [triggerInterruptionPause]);
+
+  // Drift-free wall-clock timing loop for active breathwork session
   useEffect(() => {
     if (!isRunning || session.isPaused) return;
 
     let rafId = 0;
-    let lastTime = performance.now();
-    let lastUiSyncTime = lastTime;
+    let lastWallMs = Date.now();
+    let lastUiSyncMs = lastWallMs;
 
-    const tick = (now: number) => {
-      const rawDelta = now - lastTime;
-      lastTime = now;
-      const deltaMs = Math.min(100, Math.max(0, rawDelta));
+    const advanceStep = () => {
+      const now = Date.now();
+      const deltaMs = Math.max(0, now - lastWallMs);
+      lastWallMs = now;
+      if (deltaMs === 0) return;
 
       const prevState = sessionRef.current;
       const { nextState, transition } = stepSession(prevState, deltaMs);
       sessionRef.current = nextState;
+
+      breathAudio.updateAmbientState(nextState.phase, getPhaseProgress(nextState));
 
       if (transition) {
         const speechText = getTransitionSpeechText(nextState);
@@ -801,71 +968,87 @@ export default function App() {
           totalBreaths: nextState.config.breathCount,
           currentRound: nextState.currentRound,
           totalRounds: nextState.config.rounds,
+          phaseDurationMs: nextState.phaseDurationMs,
         });
         if (
-          progressUpdatesEnabled &&
-          audioEnabled &&
+          audioPrefs.narrationLevel !== 'minimal' &&
+          audioPrefs.audioEnabled &&
           speechText &&
           speechText !== 'Inhale' &&
           speechText !== 'Exhale'
         ) {
           showAudioCaption(speechText);
         }
-        if (transition.to === 'completed') {
-          recordCompletedSession(nextState);
-        }
-        lastUiSyncTime = now;
+        lastUiSyncMs = now;
         setSession(nextState);
       } else {
         const update = evaluateProgressAudioUpdate(
           prevState,
           nextState,
-          emittedUpdatesRef.current
+          emittedUpdatesRef.current,
+          audioPrefs.narrationLevel
         );
-        if (update) {
+        if (update && audioPrefs.narrationLevel !== 'minimal') {
           breathAudio.playProgressUpdate(update.text, update.tone);
-          if (progressUpdatesEnabled && audioEnabled) {
+          if (audioPrefs.audioEnabled) {
             showAudioCaption(update.text);
           }
         }
-        if (now - lastUiSyncTime >= 100) {
-          lastUiSyncTime = now;
+        if (now - lastUiSyncMs >= 100) {
+          lastUiSyncMs = now;
           setSession(nextState);
         }
       }
+    };
 
-      if (nextState.phase !== 'completed' && nextState.phase !== 'idle' && !nextState.isPaused) {
-        rafId = window.requestAnimationFrame(tick);
+    const tickFrame = () => {
+      advanceStep();
+      const cur = sessionRef.current;
+      if (cur.phase !== 'completed' && cur.phase !== 'idle' && !cur.isPaused) {
+        rafId = window.requestAnimationFrame(tickFrame);
       }
     };
 
-    rafId = window.requestAnimationFrame(tick);
-    return () => window.cancelAnimationFrame(rafId);
-  }, [
-    isRunning,
-    session.isPaused,
-    recordCompletedSession,
-    progressUpdatesEnabled,
-    audioEnabled,
-    showAudioCaption,
-  ]);
+    rafId = window.requestAnimationFrame(tickFrame);
+    const intervalId = window.setInterval(advanceStep, 250);
 
-  const handleStart = useCallback(() => {
-    breathAudio.unlock().catch(() => {});
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      window.clearInterval(intervalId);
+    };
+  }, [isRunning, session.isPaused, audioPrefs.narrationLevel, audioPrefs.audioEnabled, showAudioCaption]);
+
+  const handleRequestStart = useCallback(() => {
+    void breathAudio.unlock().then(refreshReadiness);
+    setShowSafetyModal(true);
+  }, [refreshReadiness]);
+
+  const handleConfirmStart = useCallback(() => {
+    setShowSafetyModal(false);
+    clearSoundscapePreviewTimer();
+    void breathAudio.unlock().then(refreshReadiness);
     breathAudio.stopPreview();
     setPreviewingFileId(null);
-    recordedCompletionRef.current = false;
     emittedUpdatesRef.current.clear();
     setAudioUpdateCaption(null);
+
+    if (interfacePrefs.autoFocusMode) {
+      setIsFocusMode(true);
+    }
+
     const started = startSession(config);
     sessionRef.current = started;
     setSession(started);
-    breathAudio.playPhaseCue('inhale', 1, getTransitionSpeechText(started), {
+    breathAudio.setSessionRunning(true);
+    void acquireWakeLock().then(setWakeLockActive);
+
+    breathAudio.playPhaseCue(started.phase, started.currentBreath, getTransitionSpeechText(started), {
       totalBreaths: started.config.breathCount,
       currentRound: started.currentRound,
       totalRounds: started.config.rounds,
+      phaseDurationMs: started.phaseDurationMs,
     });
-  }, [config]);
+  }, [clearSoundscapePreviewTimer, config, interfacePrefs.autoFocusMode, refreshReadiness]);
 
   const handleTogglePause = useCallback(() => {
     setSession((prev) => {
@@ -875,11 +1058,24 @@ export default function App() {
         breathAudio.stopActiveVoice();
         breathAudio.stopSpeech();
       }
-      const next = { ...prev, isPaused: nextPaused };
+      const next = nextPaused
+        ? { ...prev, isPaused: true }
+        : resumeFromPause(prev);
       sessionRef.current = next;
       return next;
     });
   }, []);
+
+  const handleResumeAfterInterruption = useCallback(() => {
+    void breathAudio.unlock().then(refreshReadiness);
+    const current = sessionRef.current;
+    if (current.phase === 'idle' || current.phase === 'completed') return;
+    const resumed = resumeFromPause(current);
+    sessionRef.current = resumed;
+    setSession(resumed);
+    breathAudio.setSessionRunning(true);
+    void acquireWakeLock().then(setWakeLockActive);
+  }, [refreshReadiness]);
 
   const handleSkipPhase = useCallback(() => {
     setSession((prev) => {
@@ -891,43 +1087,60 @@ export default function App() {
           totalBreaths: next.config.breathCount,
           currentRound: next.currentRound,
           totalRounds: next.config.rounds,
+          phaseDurationMs: next.phaseDurationMs,
         });
         if (
-          progressUpdatesEnabled &&
-          audioEnabled &&
+          audioPrefs.narrationLevel !== 'minimal' &&
+          audioPrefs.audioEnabled &&
           speechText &&
           speechText !== 'Inhale' &&
           speechText !== 'Exhale'
         ) {
           showAudioCaption(speechText);
         }
-        if (next.phase === 'completed') {
-          recordCompletedSession(next);
-        }
       }
       return next;
     });
-  }, [audioEnabled, progressUpdatesEnabled, recordCompletedSession, showAudioCaption]);
+  }, [audioPrefs.audioEnabled, audioPrefs.narrationLevel, showAudioCaption]);
 
-  const handleExtendHold = useCallback(() => {
+  const handleTakeRecoveryBreath = useCallback(() => {
     setSession((prev) => {
-      const next = extendHold(prev, 15);
+      if (prev.phase !== 'hold') return prev;
+      const next = skipToNextPhase(prev);
       sessionRef.current = next;
-      // Allow the 10-seconds-remaining update to trigger again after extending hold
-      emittedUpdatesRef.current.delete(`r${next.currentRound}-hold-rem-10`);
-      if (progressUpdatesEnabled && audioEnabled) {
-        const msg = 'Hold extended by 15 seconds.';
-        breathAudio.playProgressUpdate(msg, 'milestone');
-        showAudioCaption(msg);
+      const speechText = getTransitionSpeechText(next);
+      breathAudio.playPhaseCue(next.phase, next.currentBreath, speechText, {
+        totalBreaths: next.config.breathCount,
+        currentRound: next.currentRound,
+        totalRounds: next.config.rounds,
+        phaseDurationMs: next.phaseDurationMs,
+      });
+      if (audioPrefs.audioEnabled && speechText) {
+        showAudioCaption(speechText);
       }
       return next;
     });
-  }, [audioEnabled, progressUpdatesEnabled, showAudioCaption]);
+  }, [audioPrefs.audioEnabled, showAudioCaption]);
 
-  const handleReset = useCallback(() => {
+  const handleEndSession = useCallback(() => {
     breathAudio.stopActiveVoice();
     breathAudio.stopSpeech();
-    recordedCompletionRef.current = false;
+    breathAudio.setSessionRunning(false);
+    void releaseWakeLock().then(() => setWakeLockActive(false));
+    emittedUpdatesRef.current.clear();
+    setAudioUpdateCaption(null);
+    void breathAudio.playSafetyStopCue();
+    const ended = endSessionEarly(sessionRef.current);
+    sessionRef.current = ended;
+    setSession(ended);
+  }, []);
+
+  const handleBackToSetup = useCallback(() => {
+    breathAudio.stopActiveVoice();
+    breathAudio.stopSpeech();
+    breathAudio.setSessionRunning(false);
+    void releaseWakeLock().then(() => setWakeLockActive(false));
+    setIsFocusMode(false);
     emittedUpdatesRef.current.clear();
     setAudioUpdateCaption(null);
     const reset = createInitialState(config);
@@ -958,62 +1171,99 @@ export default function App() {
     });
   }, []);
 
-  const handleToggleAudio = useCallback(() => {
-    setAudioEnabled((prev) => {
-      const next = !prev;
-      breathAudio.setEnabled(next);
-      if (next) breathAudio.unlock().catch(() => {});
-      return next;
-    });
+  const handleSaveCustomPreset = useCallback(
+    (name: string): boolean => {
+      const created = createCustomPreset(name, config);
+      if (!created) return false;
+      setCustomPresets((prev) => [created, ...prev].slice(0, 12));
+      setActivePresetId(created.id);
+      return true;
+    },
+    [config]
+  );
+
+  const handleDeleteCustomPreset = useCallback((presetId: string) => {
+    setCustomPresets((prev) => prev.filter((p) => p.id !== presetId));
+    setActivePresetId((curr) => (curr === presetId ? null : curr));
   }, []);
 
-  const handleClearHistory = useCallback(() => {
-    setHistory([]);
-    saveHistory([]);
-  }, []);
+  const handleToggleAudio = useCallback(() => {
+    setAudioPrefs((prev) => {
+      const nextEnabled = !prev.audioEnabled;
+      if (nextEnabled) {
+        void breathAudio.unlock().then(refreshReadiness);
+      }
+      return { ...prev, audioEnabled: nextEnabled };
+    });
+  }, [refreshReadiness]);
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (showSafetyModal) return;
       const tag = (e.target as HTMLElement | null)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'BUTTON') {
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+        return;
+      }
+      if (e.code === 'Escape') {
+        if (isFocusMode) {
+          e.preventDefault();
+          setIsFocusMode(false);
+        } else if (isRunning) {
+          e.preventDefault();
+          handleEndSession();
+        }
+        return;
+      }
+      if (tag === 'BUTTON') {
         return;
       }
       if (e.code === 'Space') {
         e.preventDefault();
         if (sessionRef.current.phase === 'idle' || sessionRef.current.phase === 'completed') {
-          handleStart();
+          handleRequestStart();
+        } else if (sessionRef.current.isPaused && sessionRef.current.interruptionReason) {
+          handleResumeAfterInterruption();
         } else {
           handleTogglePause();
         }
-      } else if (e.code === 'Escape' && isRunning) {
-        handleReset();
       }
     };
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleStart, handleTogglePause, handleReset, isRunning]);
+  }, [
+    showSafetyModal,
+    handleRequestStart,
+    handleResumeAfterInterruption,
+    handleTogglePause,
+    handleEndSession,
+    isFocusMode,
+    isRunning,
+  ]);
 
   const primaryHeaderAction = () => {
     if (!isRunning) {
-      handleStart();
+      handleRequestStart();
+    } else if (session.isPaused && session.interruptionReason) {
+      handleResumeAfterInterruption();
     } else {
       handleTogglePause();
     }
   };
 
   const activeVoiceClipCount = Object.values(loadedClipIds).filter(Boolean).length;
+  const effectiveReducedMotion = osReducedMotion || interfacePrefs.reducedMotionOverride;
 
   return (
-    <div className="min-h-screen bg-[#0B1117] text-slate-100 flex flex-col">
+    <div className="min-h-[100dvh] bg-[#0B1117] text-slate-100 flex flex-col">
       {/* Three-Zone Top Bar Contract */}
-      <header className="sticky top-0 z-30 border-b border-slate-800/80 bg-[#0B1117]/90 backdrop-blur-md">
-        <div className="mx-auto flex max-w-7xl items-center justify-between gap-8 px-4 sm:px-6 lg:px-8 py-3.5">
+      <header className="sticky top-0 z-30 border-b border-slate-800/80 bg-[#0B1117]/90 backdrop-blur-md pt-[env(safe-area-inset-top)]">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-6 px-4 sm:px-6 lg:px-8 py-3.5">
           <a
             href="#studio"
             className="font-display text-lg font-semibold tracking-tight text-slate-50 whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sky-400 rounded-sm"
           >
-            Cadence
+            BREATHFLOW
           </a>
 
           <nav
@@ -1030,13 +1280,7 @@ export default function App() {
               href="#voice"
               className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
             >
-              Voice
-            </a>
-            <a
-              href="#history"
-              className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
-            >
-              History
+              Audio
             </a>
             <a
               href="#guide"
@@ -1050,7 +1294,7 @@ export default function App() {
             <button
               type="button"
               onClick={primaryHeaderAction}
-              className="rounded-lg bg-sky-400 px-4 py-2 text-xs sm:text-sm font-semibold text-slate-950 hover:bg-sky-300 transition-colors min-h-[40px] whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-300"
+              className="rounded-xl bg-sky-400 px-4 py-2.5 text-xs sm:text-sm font-semibold text-slate-950 hover:bg-sky-300 transition-colors min-h-[44px] whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-300"
             >
               {!isRunning ? 'Start Session' : session.isPaused ? 'Resume' : 'Pause'}
             </button>
@@ -1063,18 +1307,22 @@ export default function App() {
         className="mx-auto w-full max-w-7xl flex-1 px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-10"
       >
         {/* Compact Studio Header */}
-        <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+        <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
           <div>
             <h1 className="font-display text-2xl sm:text-3xl font-semibold tracking-tight text-slate-50 text-balance">
-              Guided Breathwork Studio
+              BREATHFLOW Guided Breathwork Studio
             </h1>
             <p className="mt-1 text-sm text-slate-400">
-              1–40 rhythmic inhale and exhale cycles followed by an adjustable breath hold and recovery breath.
+              30 breaths × 3 rounds by default, customizable holds, offline voice guidance, and distraction-free focus mode.
             </p>
           </div>
-          <p className="hidden sm:block font-mono text-xs text-slate-400 tabular-nums whitespace-nowrap">
-            Space to {isRunning ? (session.isPaused ? 'resume' : 'pause') : 'start'}
-          </p>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <PWAInstallControl />
+            <p className="hidden lg:block font-mono text-xs text-slate-400 tabular-nums whitespace-nowrap">
+              Space to {isRunning ? (session.isPaused ? 'resume' : 'pause') : 'start'}
+            </p>
+          </div>
         </div>
 
         {/* Two-Zone Interactive Stage + Control Deck */}
@@ -1082,32 +1330,41 @@ export default function App() {
           <div className="lg:col-span-7 flex flex-col">
             <BreathVisualizer
               session={session}
-              audioEnabled={audioEnabled}
+              audioEnabled={audioPrefs.audioEnabled}
               voiceClipCount={activeVoiceClipCount}
               audioUpdateCaption={audioUpdateCaption}
+              isFocusMode={isFocusMode}
+              reducedMotion={effectiveReducedMotion}
+              wakeLockActive={wakeLockActive}
+              onToggleFocusMode={() => setIsFocusMode((prev) => !prev)}
               onToggleAudio={handleToggleAudio}
-              onStart={handleStart}
+              onStart={handleRequestStart}
               onTogglePause={handleTogglePause}
+              onResumeAfterInterruption={handleResumeAfterInterruption}
+              onTakeRecoveryBreath={handleTakeRecoveryBreath}
               onSkipPhase={handleSkipPhase}
-              onExtendHold={handleExtendHold}
-              onReset={handleReset}
+              onEndSession={handleEndSession}
+              onBackToSetup={handleBackToSetup}
             />
           </div>
 
           <div className="lg:col-span-5 flex flex-col">
             <ProtocolControls
               config={config}
+              customPresets={customPresets}
               activePresetId={activePresetId}
               locked={isRunning}
               syncInhaleExhale={syncInhaleExhale}
               onToggleSyncInhaleExhale={() => setSyncInhaleExhale((prev) => !prev)}
               onChangeConfig={handleChangeConfig}
               onSelectPreset={handleSelectPreset}
+              onSaveCustomPreset={handleSaveCustomPreset}
+              onDeleteCustomPreset={handleDeleteCustomPreset}
             />
           </div>
         </div>
 
-        {/* Google Drive TTS Guided Audio Integration */}
+        {/* Audio, Narration, Dynamic Soundscapes & Collapsible Advanced Settings */}
         <DriveVoicePanel
           user={user}
           needsAuth={needsAuth}
@@ -1121,9 +1378,14 @@ export default function App() {
           countClips={countClips}
           loadedClipIds={loadedClipIds}
           loadingFileIds={loadingFileIds}
-          audioMode={audioMode}
-          speechFallbackEnabled={speechFallbackEnabled}
-          progressUpdatesEnabled={progressUpdatesEnabled}
+          audioMode={audioPrefs.audioMode}
+          narrationLevel={audioPrefs.narrationLevel}
+          soundscape={audioPrefs.soundscape}
+          volumes={audioPrefs.volumes}
+          readinessReport={readinessReport}
+          speechFallbackEnabled={audioPrefs.speechFallbackEnabled}
+          reducedMotionOverride={interfacePrefs.reducedMotionOverride}
+          autoFocusMode={interfacePrefs.autoFocusMode}
           previewingFileId={previewingFileId}
           onSignIn={handleSignIn}
           onSignOut={handleSignOut}
@@ -1132,24 +1394,39 @@ export default function App() {
           onAssignPhaseFile={handleAssignPhaseFile}
           onAutoMatchAll={handleAutoMatchAll}
           onChangeAudioMode={handleChangeAudioMode}
+          onChangeNarrationLevel={handleChangeNarrationLevel}
+          onChangeSoundscape={handleChangeSoundscape}
+          onPreviewSoundscape={handlePreviewSoundscape}
+          onChangeVolumes={handleChangeVolumes}
           onToggleSpeechFallback={handleToggleSpeechFallback}
-          onToggleProgressUpdates={handleToggleProgressUpdates}
-          onTestAudio={handleTestAudio}
+          onToggleReducedMotion={handleToggleReducedMotion}
+          onToggleAutoFocusMode={handleToggleAutoFocusMode}
+          onRunAudioCheck={handleRunAudioCheck}
           onPlayBriefing={handlePlayBriefing}
           onPreviewFile={handlePreviewFile}
           onStopPreview={handleStopPreview}
           onClearCachedClips={handleClearCachedClips}
         />
 
-        <SessionHistoryAndGuide history={history} onClearHistory={handleClearHistory} />
+        <SafetyAndGuide />
       </main>
 
-      <footer className="border-t border-slate-800/80 py-6">
+      <footer className="border-t border-slate-800/80 py-6 pb-[calc(1.5rem+env(safe-area-inset-bottom))]">
         <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
-          <span>Cadence Breathwork Studio</span>
-          <span>Local-only session storage · Google Drive audio read-only</span>
+          <span>BREATHFLOW Studio</span>
+          <span>Preferences stored locally · Zero session or hold history saved</span>
         </div>
       </footer>
+
+      <SafetyReminderModal
+        open={showSafetyModal}
+        prepCountdownSec={config.prepCountdownSec}
+        rounds={config.rounds}
+        breathCount={config.breathCount}
+        onConfirmStart={handleConfirmStart}
+        onPlaySafetyAudio={() => void handlePlayBriefing('safety')}
+        onCancel={() => setShowSafetyModal(false)}
+      />
     </div>
   );
 }

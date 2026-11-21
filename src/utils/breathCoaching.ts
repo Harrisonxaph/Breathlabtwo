@@ -1,4 +1,5 @@
-import { BreathSessionState, formatSeconds } from './breathEngine';
+import { BreathSessionState } from './breathEngine';
+import { NarrationLevel } from './breathAudioPolicy';
 
 export interface AudioProgressUpdate {
   key: string;
@@ -7,22 +8,39 @@ export interface AudioProgressUpdate {
 }
 
 /**
- * Returns calm, context-aware encouraging words for the on-screen visualizer
- * based on current breath cycle, elapsed hold time, round, and completion.
+ * Returns calm, non-competitive guidance for the on-screen visualizer
+ * based on phase, round, and body-listening safety cues.
  */
 export function getEncouragingInstruction(state: BreathSessionState): string {
-  const { phase, config, currentBreath, currentRound, phaseElapsedMs, phaseDurationMs } = state;
+  const {
+    phase,
+    config,
+    currentBreath,
+    currentRound,
+    phaseElapsedMs,
+    phaseDurationMs,
+    endedEarly,
+    interruptionReason,
+    isPaused,
+  } = state;
+
+  if (isPaused && interruptionReason) {
+    return 'Session paused — take a few easy, natural breaths before resuming.';
+  }
 
   switch (phase) {
     case 'idle':
-      return 'Adjust your cadence, settle your posture, and press Start when ready.';
+      return 'Adjust your cadence, sit or lie somewhere safe, and press Start when ready.';
+
+    case 'preparing':
+      return 'Settle into a comfortable posture — relax your jaw and shoulders.';
 
     case 'inhale':
     case 'exhale': {
       const total = config.breathCount;
 
       if (currentBreath === 1 && currentRound > 1 && phase === 'inhale') {
-        return `Round ${currentRound} of ${config.rounds} — carry that calm, open focus forward.`;
+        return `Round ${currentRound} of ${config.rounds} — move at a calm, unforced pace.`;
       }
 
       if (currentBreath === 1) {
@@ -33,8 +51,8 @@ export function getEncouragingInstruction(state: BreathSessionState): string {
 
       if (currentBreath === total) {
         return phase === 'inhale'
-          ? 'Final deep breath of this round — fill up smoothly and prepare to let go.'
-          : 'Final exhale — empty gently and settle into stillness.';
+          ? 'Final breath of this round — fill up smoothly and prepare to let go.'
+          : 'Final exhale — empty gently and rest in stillness.';
       }
 
       if (total >= 8 && currentBreath >= total - 2) {
@@ -42,15 +60,15 @@ export function getEncouragingInstruction(state: BreathSessionState): string {
       }
 
       if (total >= 10 && currentBreath === Math.ceil(total / 2)) {
-        return `Halfway there (${currentBreath}/${total}) — soften your jaw and drop your shoulders.`;
+        return `Halfway through round ${currentRound} (${currentBreath}/${total}) — soften your jaw and shoulders.`;
       }
 
       if (total >= 16 && currentBreath === Math.round(total * 0.25)) {
-        return 'Great cadence — stay relaxed and let each exhale release tension.';
+        return 'Steady cadence — stay relaxed and let each exhale release tension.';
       }
 
       if (total >= 16 && currentBreath === Math.round(total * 0.75)) {
-        return 'Three-quarters complete — steady rhythm, calm mind.';
+        return 'Three-quarters through this round — comfortable, unforced rhythm.';
       }
 
       return phase === 'inhale'
@@ -64,68 +82,62 @@ export function getEncouragingInstruction(state: BreathSessionState): string {
       const remainingSec = Math.max(0, durationSec - elapsedSec);
 
       if (durationSec >= 25 && remainingSec <= 10) {
-        return '10 seconds remaining — stay soft until your deep recovery breath.';
+        return '10 seconds left — stay relaxed until your recovery breath, or recover now if ready.';
       }
-      if (elapsedSec >= 120) {
-        return 'Over two minutes — deep, quiet stillness. Recover whenever you wish.';
+
+      if (config.roundRetentionCues && config.rounds > 1 && elapsedSec < 15) {
+        return `Round ${currentRound} retention — soften your body and breathe whenever you feel ready.`;
       }
-      if (elapsedSec >= 90) {
-        return '90 seconds — effortless presence. Let every muscle stay loose.';
-      }
+
       if (elapsedSec >= 60) {
-        return 'Over one minute of stillness — remarkable calm and ease.';
-      }
-      if (elapsedSec >= 45) {
-        return '45 seconds — steady and composed. Release early anytime.';
+        return 'Resting comfortably in stillness — take your recovery breath anytime your body signals.';
       }
       if (elapsedSec >= 30) {
-        return '30 seconds in — trust the quiet and release any tension.';
+        return 'Quiet stillness — keep your shoulders loose and recover whenever you wish.';
       }
       if (elapsedSec >= 15) {
-        return '15 seconds — doing great, soften your shoulders and jaw.';
+        return 'Doing well — no need to strain; take your recovery breath anytime.';
       }
-      return 'Rest in stillness after the exhale. Release early anytime.';
+      return 'Rest softly after the exhale. Take your recovery breath anytime you feel the urge.';
     }
 
     case 'recovery_inhale':
-      return 'Take one full, nourishing breath all the way to the top.';
+      return 'Take one full, comfortable recovery breath all the way in.';
 
     case 'recovery_hold': {
       const durationSec = phaseDurationMs / 1000;
       const remainingSec = Math.max(0, (phaseDurationMs - phaseElapsedMs) / 1000);
       if (durationSec >= 12 && remainingSec <= 5) {
-        return 'Almost ready to release — stay calm and steady.';
+        return 'Almost ready to release — let your neck and shoulders stay soft.';
       }
-      return 'Hold the recovery breath gently at the top — soak in the reset.';
+      return 'Rest gently with the recovery breath at the top.';
     }
 
     case 'recovery_exhale':
       return currentRound < config.rounds
-        ? 'Exhale slowly and reset — next round begins in a moment.'
-        : 'Exhale slowly and settle. Well done on completing this cycle.';
+        ? 'Exhale slowly and allow your breathing to settle before the next round.'
+        : 'Exhale slowly and return to your natural breathing rhythm.';
 
     case 'completed': {
-      const bestHold =
-        state.holdDurationsAchievedSec.length > 0
-          ? Math.max(...state.holdDurationsAchievedSec)
-          : 0;
-      if (bestHold > 0) {
-        return `Well done — ${state.totalBreathsCompleted} breaths and a ${formatSeconds(bestHold)} peak hold completed.`;
+      if (endedEarly) {
+        return 'Session ended safely — breathe normally and take a moment before standing.';
       }
-      return 'Well done — take a quiet moment to notice the calm in your body.';
+      return `Session complete — ${state.totalBreathsCompleted} breaths across ${config.rounds} ${config.rounds === 1 ? 'round' : 'rounds'}. Allow breathing to settle before getting up.`;
     }
   }
 }
 
 /**
- * Generates concise spoken transition cues for phase changes, weaving in
- * milestone encouragement without overlapping short inhale/exhale intervals.
+ * Generates concise spoken transition cues for phase changes without competitive hold phrasing.
  */
 export function getTransitionSpeechText(state: BreathSessionState): string {
   const { phase, config, currentBreath, currentRound } = state;
   const total = config.breathCount;
 
   switch (phase) {
+    case 'preparing':
+      return 'Find a comfortable position';
+
     case 'inhale': {
       if (currentBreath === 1 && currentRound > 1) {
         return `Round ${currentRound}. Inhale`;
@@ -140,7 +152,7 @@ export function getTransitionSpeechText(state: BreathSessionState): string {
         return 'Five breaths left';
       }
       if (total >= 10 && currentBreath === total - 2) {
-        return 'Three left';
+        return 'Last few breaths';
       }
       if (total >= 12 && currentBreath % 10 === 0 && currentBreath < total) {
         return `${currentBreath} breaths`;
@@ -156,19 +168,24 @@ export function getTransitionSpeechText(state: BreathSessionState): string {
     }
 
     case 'hold':
-      return 'Breath hold. Relax and soften.';
+      if (config.roundRetentionCues && config.rounds > 1) {
+        return `Round ${currentRound} breath hold. Breathe whenever your body needs to.`;
+      }
+      return 'Rest after the exhale. Breathe whenever your body needs to.';
 
     case 'recovery_inhale':
-      return 'Deep recovery breath in';
+      return 'Deep comfortable recovery breath in';
 
     case 'recovery_hold':
-      return 'Hold calmly';
+      return 'Rest gently with that breath';
 
     case 'recovery_exhale':
-      return currentRound < config.rounds ? 'Release slowly' : 'Release slowly. Well done.';
+      return currentRound < config.rounds
+        ? 'Release and settle for the next round'
+        : 'Release and return to natural breath.';
 
     case 'completed':
-      return 'Session complete. Great work.';
+      return 'Your breathing session is complete. Take a moment before standing.';
 
     case 'idle':
     default:
@@ -176,26 +193,25 @@ export function getTransitionSpeechText(state: BreathSessionState): string {
   }
 }
 
-const HOLD_CHECKPOINTS_SEC: { sec: number; minDuration: number; text: string }[] = [
-  { sec: 15, minDuration: 30, text: '15 seconds. Stay relaxed.' },
-  { sec: 30, minDuration: 45, text: '30 seconds. Calm and steady.' },
-  { sec: 45, minDuration: 65, text: '45 seconds. Doing great.' },
-  { sec: 60, minDuration: 75, text: 'One minute. Effortless stillness.' },
-  { sec: 90, minDuration: 105, text: '90 seconds. Deep calm.' },
-  { sec: 120, minDuration: 135, text: 'Two minutes. Stay completely loose.' },
-  { sec: 150, minDuration: 165, text: 'Two minutes thirty. Steady focus.' },
-  { sec: 180, minDuration: 195, text: 'Three minutes. Remarkable presence.' },
+const HOLD_CHECKPOINTS_SEC: { sec: number; minDuration: number; text: string; activeOnly?: boolean }[] = [
+  { sec: 15, minDuration: 30, text: '15 seconds. Keep your shoulders relaxed.', activeOnly: true },
+  { sec: 30, minDuration: 45, text: '30 seconds. No rush, breathe anytime.' },
+  { sec: 45, minDuration: 65, text: '45 seconds. Stay soft and comfortable.', activeOnly: true },
+  { sec: 60, minDuration: 75, text: 'One minute elapsed. Recover whenever ready.' },
+  { sec: 90, minDuration: 105, text: '90 seconds elapsed. Breathe anytime you wish.' },
+  { sec: 120, minDuration: 135, text: 'Two minutes elapsed. Stay comfortable.', activeOnly: true },
+  { sec: 150, minDuration: 165, text: 'Two minutes thirty. Recover whenever ready.', activeOnly: true },
+  { sec: 180, minDuration: 195, text: 'Three minutes elapsed. Breathe whenever ready.', activeOnly: true },
 ];
 
 /**
- * Evaluates whether a mid-phase audio update (such as hold time milestones
- * or final-seconds reminders) should fire between prevState and nextState.
- * Emitted keys are tracked in `emittedKeys` so updates fire at most once per round.
+ * Evaluates whether a mid-phase audio update should fire based on narration level.
  */
 export function evaluateProgressAudioUpdate(
   prevState: BreathSessionState,
   nextState: BreathSessionState,
-  emittedKeys: Set<string>
+  emittedKeys: Set<string>,
+  narrationLevel: NarrationLevel = 'balanced'
 ): AudioProgressUpdate | null {
   if (nextState.isPaused || prevState.phase !== nextState.phase) {
     return null;
@@ -209,19 +225,25 @@ export function evaluateProgressAudioUpdate(
     const nextRemainingSec = Math.max(0, durationSec - nextElapsedSec);
     const roundPrefix = `r${nextState.currentRound}`;
 
-    for (const cp of HOLD_CHECKPOINTS_SEC) {
-      if (durationSec < cp.minDuration) continue;
-      // Avoid firing an elapsed checkpoint right on top of the 10s-remaining cue
-      if (durationSec >= 25 && Math.abs(durationSec - 10 - cp.sec) <= 4) continue;
+    if (narrationLevel !== 'minimal') {
+      for (const cp of HOLD_CHECKPOINTS_SEC) {
+        if (cp.activeOnly && narrationLevel !== 'active') continue;
+        if (durationSec < cp.minDuration) continue;
+        if (durationSec >= 25 && Math.abs(durationSec - 10 - cp.sec) <= 4) continue;
 
-      const key = `${roundPrefix}-hold-${cp.sec}`;
-      if (!emittedKeys.has(key) && prevElapsedSec < cp.sec && nextElapsedSec >= cp.sec) {
-        emittedKeys.add(key);
-        return {
-          key,
-          text: cp.text,
-          tone: 'milestone',
-        };
+        const key = `${roundPrefix}-hold-${cp.sec}`;
+        if (!emittedKeys.has(key) && prevElapsedSec < cp.sec && nextElapsedSec >= cp.sec) {
+          emittedKeys.add(key);
+          const roundTag =
+            nextState.config.roundRetentionCues && nextState.config.rounds > 1
+              ? `Round ${nextState.currentRound}: `
+              : '';
+          return {
+            key,
+            text: `${roundTag}${cp.text}`,
+            tone: 'milestone',
+          };
+        }
       }
     }
 
@@ -238,11 +260,17 @@ export function evaluateProgressAudioUpdate(
     }
   }
 
-  if (nextState.phase === 'recovery_hold') {
+  if (nextState.phase === 'recovery_hold' && narrationLevel !== 'minimal') {
     const durationSec = nextState.phaseDurationMs / 1000;
     if (durationSec >= 15) {
-      const prevRemainingSec = Math.max(0, (prevState.phaseDurationMs - prevState.phaseElapsedMs) / 1000);
-      const nextRemainingSec = Math.max(0, (nextState.phaseDurationMs - nextState.phaseElapsedMs) / 1000);
+      const prevRemainingSec = Math.max(
+        0,
+        (prevState.phaseDurationMs - prevState.phaseElapsedMs) / 1000
+      );
+      const nextRemainingSec = Math.max(
+        0,
+        (nextState.phaseDurationMs - nextState.phaseElapsedMs) / 1000
+      );
       const key = `r${nextState.currentRound}-rec-rem-5`;
       if (!emittedKeys.has(key) && prevRemainingSec > 5 && nextRemainingSec <= 5) {
         emittedKeys.add(key);

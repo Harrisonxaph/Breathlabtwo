@@ -1,6 +1,6 @@
 import { BreathPhase } from './breathEngine';
 
-export type VoicePhaseSlot = Exclude<BreathPhase, 'idle'>;
+export type VoicePhaseSlot = Exclude<BreathPhase, 'idle' | 'preparing'>;
 
 export interface DriveAudioFile {
   id: string;

@@ -1,20 +1,41 @@
 import { BreathPhase } from './breathEngine';
 import { VoicePhaseSlot } from './driveAudioMatcher';
+import {
+  AudioMode,
+  AudioVolumeSettings,
+  DEFAULT_AUDIO_VOLUMES,
+  NarrationLevel,
+  SoundscapeId,
+  clampAudioVolumes,
+  getAmbientPhaseTarget,
+  resolveCueSchedule,
+  shouldPlayVoiceForPhase,
+} from './breathAudioPolicy';
 
-export type AudioMode = 'voice_and_chimes' | 'voice_only' | 'chimes_only';
+export type { AudioMode, AudioVolumeSettings, NarrationLevel, SoundscapeId };
 
-function getSpeechCueText(phase: BreathPhase, breathNumber?: number): string {
+export interface AudioReadinessReport {
+  contextState: AudioContextState | 'uninitialized' | 'unavailable';
+  bundledClipsCount: number;
+  decodedClipsCount: number;
+  speechSynthesisAvailable: boolean;
+  offlineServiceWorkerReady: boolean;
+}
+
+function getSpeechCueText(phase: BreathPhase): string {
   switch (phase) {
+    case 'preparing':
+      return 'Find a comfortable position';
     case 'inhale':
-      return breathNumber === 1 ? 'Inhale' : 'Inhale';
+      return 'Inhale';
     case 'exhale':
       return 'Exhale';
     case 'hold':
-      return 'Hold your breath';
+      return 'Rest comfortably after the exhale';
     case 'recovery_inhale':
       return 'Deep recovery breath in';
     case 'recovery_hold':
-      return 'Hold';
+      return 'Rest gently';
     case 'recovery_exhale':
       return 'Release slowly';
     case 'completed':
@@ -25,14 +46,31 @@ function getSpeechCueText(phase: BreathPhase, breathNumber?: number): string {
   }
 }
 
+interface ActiveAmbientGraph {
+  soundscape: SoundscapeId;
+  masterGain: GainNode;
+  filter: BiquadFilterNode;
+  stopNodes: () => void;
+}
+
 class BreathAudioEngine {
   private ctx: AudioContext | null = null;
   private compressor: DynamicsCompressorNode | null = null;
+  private voiceBus: GainNode | null = null;
+  private chimeBus: GainNode | null = null;
+  private ambientGraph: ActiveAmbientGraph | null = null;
+
   private enabled = true;
   private mode: AudioMode = 'voice_and_chimes';
+  private narrationLevel: NarrationLevel = 'balanced';
+  private soundscape: SoundscapeId = 'off';
+  private volumes: AudioVolumeSettings = { ...DEFAULT_AUDIO_VOLUMES };
   private speechFallbackEnabled = true;
   private progressUpdatesEnabled = true;
   private onPlaybackError: ((message: string) => void) | null = null;
+  private onAudioInterruption: (() => void) | null = null;
+  private expectSessionRunning = false;
+  private hasContextBeenRunning = false;
 
   // Raw ArrayBuffers, decoded AudioBuffers, typed Blob URLs, and bundled local URLs keyed by file ID
   private rawBuffers = new Map<string, ArrayBuffer>();
@@ -61,18 +99,37 @@ class BreathAudioEngine {
   private activeHtmlAudio: HTMLAudioElement | null = null;
   private previewSource: AudioBufferSourceNode | null = null;
   private previewHtmlAudio: HTMLAudioElement | null = null;
+  private scheduledVoiceTimer: number | null = null;
+  private pendingCheckResolve: (() => void) | null = null;
   private sequenceCancelled = false;
 
   public setOnPlaybackError(cb: ((message: string) => void) | null): void {
     this.onPlaybackError = cb;
   }
 
+  public setOnAudioInterruption(cb: (() => void) | null): void {
+    this.onAudioInterruption = cb;
+  }
+
+  public setSessionRunning(running: boolean): void {
+    this.expectSessionRunning = running;
+    if (!running) {
+      this.stopAmbient();
+    } else if (this.enabled && this.soundscape !== 'off') {
+      this.startAmbient();
+    }
+  }
+
   public setEnabled(enabled: boolean): void {
     this.enabled = enabled;
     if (!enabled) {
+      this.clearScheduledVoice();
       this.stopActiveVoice();
       this.stopPreview();
       this.stopSpeech();
+      this.stopAmbient();
+    } else if (this.expectSessionRunning && this.soundscape !== 'off') {
+      this.startAmbient();
     }
   }
 
@@ -83,6 +140,7 @@ class BreathAudioEngine {
   public setMode(mode: AudioMode): void {
     this.mode = mode;
     if (mode === 'chimes_only') {
+      this.clearScheduledVoice();
       this.stopActiveVoice();
       this.stopSpeech();
     }
@@ -90,6 +148,62 @@ class BreathAudioEngine {
 
   public getMode(): AudioMode {
     return this.mode;
+  }
+
+  public setNarrationLevel(level: NarrationLevel): void {
+    this.narrationLevel = level;
+  }
+
+  public getNarrationLevel(): NarrationLevel {
+    return this.narrationLevel;
+  }
+
+  public setSoundscape(soundscape: SoundscapeId): void {
+    const changed = this.soundscape !== soundscape;
+    this.soundscape = soundscape;
+    if (!changed) return;
+
+    if (soundscape === 'off' || !this.enabled) {
+      this.stopAmbient();
+    } else if (this.expectSessionRunning) {
+      this.stopAmbient();
+      this.startAmbient();
+    }
+  }
+
+  public getSoundscape(): SoundscapeId {
+    return this.soundscape;
+  }
+
+  public setVolumes(next: Partial<AudioVolumeSettings>): void {
+    this.volumes = clampAudioVolumes({ ...this.volumes, ...next });
+    const ctx = this.ctx;
+    if (ctx) {
+      const now = ctx.currentTime;
+      if (this.voiceBus) {
+        this.voiceBus.gain.setTargetAtTime(this.volumes.voiceVolume * 1.4, now, 0.04);
+      }
+      if (this.chimeBus) {
+        this.chimeBus.gain.setTargetAtTime(this.volumes.chimeVolume, now, 0.04);
+      }
+      if (this.ambientGraph) {
+        this.ambientGraph.masterGain.gain.setTargetAtTime(
+          this.volumes.ambientVolume * 0.28,
+          now,
+          0.08
+        );
+      }
+    }
+    if (this.activeHtmlAudio) {
+      this.activeHtmlAudio.volume = this.volumes.voiceVolume;
+    }
+    if (this.previewHtmlAudio) {
+      this.previewHtmlAudio.volume = this.volumes.voiceVolume;
+    }
+  }
+
+  public getVolumes(): AudioVolumeSettings {
+    return { ...this.volumes };
   }
 
   public setSpeechFallbackEnabled(enabled: boolean): void {
@@ -165,8 +279,6 @@ class BreathAudioEngine {
       this.fallbackBlobUrls.set(fileId, URL.createObjectURL(blob));
     }
 
-    // Only decode immediately if AudioContext was already unlocked by a user gesture.
-    // Creating AudioContext before a user gesture forces Chrome/Safari into suspended mode.
     if (this.ctx) {
       await this.decodeIntoContext(fileId, copy, this.ctx);
     }
@@ -204,6 +316,7 @@ class BreathAudioEngine {
   }
 
   public clearAllClips(): void {
+    this.clearScheduledVoice();
     this.stopActiveVoice();
     this.stopPreview();
     this.decodedBuffers.clear();
@@ -240,20 +353,41 @@ class BreathAudioEngine {
 
     if (!this.ctx) {
       try {
-        this.ctx = new AudioCtx();
+        const ctx = new AudioCtx();
+        this.hasContextBeenRunning = ctx.state === 'running';
+        ctx.onstatechange = () => {
+          const st = ctx.state as string;
+          if (st === 'running') {
+            this.hasContextBeenRunning = true;
+            return;
+          }
+          if (
+            this.expectSessionRunning &&
+            (st === 'interrupted' || (st === 'suspended' && this.hasContextBeenRunning))
+          ) {
+            this.onAudioInterruption?.();
+          }
+        };
+        this.ctx = ctx;
       } catch {
         return null;
       }
     }
 
-    if (this.ctx.state === 'suspended') {
-      void this.ctx.resume().catch(() => {});
+    if (this.ctx.state === 'running') {
+      this.hasContextBeenRunning = true;
+    } else if (this.ctx.state === 'suspended') {
+      void this.ctx.resume().then(() => {
+        if (this.ctx?.state === 'running') {
+          this.hasContextBeenRunning = true;
+        }
+      }).catch(() => {});
     }
 
     return this.ctx;
   }
 
-  private getDestinationNode(ctx: AudioContext): AudioNode {
+  private getVoiceBus(ctx: AudioContext): AudioNode {
     if (!this.compressor || this.compressor.context !== ctx) {
       try {
         const comp = ctx.createDynamicsCompressor();
@@ -265,10 +399,28 @@ class BreathAudioEngine {
         comp.connect(ctx.destination);
         this.compressor = comp;
       } catch {
-        return ctx.destination;
+        this.compressor = null;
       }
     }
-    return this.compressor;
+
+    if (!this.voiceBus || this.voiceBus.context !== ctx) {
+      const bus = ctx.createGain();
+      bus.gain.setValueAtTime(this.volumes.voiceVolume * 1.4, ctx.currentTime);
+      bus.connect(this.compressor ?? ctx.destination);
+      this.voiceBus = bus;
+    }
+
+    return this.voiceBus;
+  }
+
+  private getChimeBus(ctx: AudioContext): AudioNode {
+    if (!this.chimeBus || this.chimeBus.context !== ctx) {
+      const bus = ctx.createGain();
+      bus.gain.setValueAtTime(this.volumes.chimeVolume, ctx.currentTime);
+      bus.connect(ctx.destination);
+      this.chimeBus = bus;
+    }
+    return this.chimeBus;
   }
 
   public async unlock(): Promise<void> {
@@ -282,8 +434,36 @@ class BreathAudioEngine {
         // Ignore; HTMLAudioElement remains available
       }
     }
+    if (ctx.state === 'running') {
+      this.hasContextBeenRunning = true;
+    }
 
     this.decodeAllPendingBuffers();
+  }
+
+  public getReadinessReport(): AudioReadinessReport {
+    const hasWindow = typeof window !== 'undefined';
+    const hasAudioCtx =
+      hasWindow &&
+      Boolean(
+        window.AudioContext ||
+          (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+      );
+
+    return {
+      contextState: !hasAudioCtx
+        ? 'unavailable'
+        : this.ctx
+          ? this.ctx.state
+          : 'uninitialized',
+      bundledClipsCount: this.localUrls.size || this.rawBuffers.size,
+      decodedClipsCount: this.decodedBuffers.size,
+      speechSynthesisAvailable: hasWindow && 'speechSynthesis' in window,
+      offlineServiceWorkerReady:
+        typeof navigator !== 'undefined' &&
+        'serviceWorker' in navigator &&
+        Boolean(navigator.serviceWorker.controller),
+    };
   }
 
   private async ensureDecodedBuffer(fileId: string): Promise<AudioBuffer | null> {
@@ -318,7 +498,20 @@ class BreathAudioEngine {
     return this.decodeIntoContext(fileId, raw, ctx);
   }
 
+  private clearScheduledVoice(): void {
+    if (this.scheduledVoiceTimer !== null && typeof window !== 'undefined') {
+      window.clearTimeout(this.scheduledVoiceTimer);
+      this.scheduledVoiceTimer = null;
+    }
+    if (this.pendingCheckResolve) {
+      const resolve = this.pendingCheckResolve;
+      this.pendingCheckResolve = null;
+      resolve();
+    }
+  }
+
   public stopActiveVoice(): void {
+    this.clearScheduledVoice();
     if (this.activeSource) {
       try {
         this.activeSource.stop();
@@ -371,8 +564,157 @@ class BreathAudioEngine {
     }
   }
 
+  private createNoiseBuffer(ctx: AudioContext, pink: boolean): AudioBuffer {
+    const sampleRate = ctx.sampleRate;
+    const length = Math.round(sampleRate * 3.0);
+    const buffer = ctx.createBuffer(1, length, sampleRate);
+    const data = buffer.getChannelData(0);
+
+    if (pink) {
+      let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+      for (let i = 0; i < length; i++) {
+        const white = Math.random() * 2 - 1;
+        b0 = 0.99886 * b0 + white * 0.0555179;
+        b1 = 0.99332 * b1 + white * 0.0750759;
+        b2 = 0.96900 * b2 + white * 0.1538520;
+        b3 = 0.86650 * b3 + white * 0.3104856;
+        b4 = 0.55000 * b4 + white * 0.5329522;
+        b5 = -0.7616 * b5 - white * 0.0168980;
+        data[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362) * 0.09;
+        b6 = white * 0.115926;
+      }
+    } else {
+      let lastOut = 0;
+      for (let i = 0; i < length; i++) {
+        const white = Math.random() * 2 - 1;
+        lastOut = (lastOut + 0.02 * white) / 1.02;
+        data[i] = lastOut * 2.8;
+      }
+    }
+    return buffer;
+  }
+
+  public startAmbient(): void {
+    if (!this.enabled || this.soundscape === 'off') return;
+    if (this.ambientGraph && this.ambientGraph.soundscape === this.soundscape) return;
+
+    this.stopAmbient();
+    const ctx = this.getOrCreateContextOnGesture();
+    if (!ctx) return;
+
+    const now = ctx.currentTime;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.setValueAtTime(420, now);
+    filter.Q.setValueAtTime(0.7, now);
+
+    const masterGain = ctx.createGain();
+    masterGain.gain.setValueAtTime(0.0001, now);
+    masterGain.gain.setTargetAtTime(Math.max(0.0001, this.volumes.ambientVolume * 0.25), now, 0.4);
+
+    filter.connect(masterGain);
+    masterGain.connect(ctx.destination);
+
+    const stopCallbacks: (() => void)[] = [];
+
+    if (this.soundscape === 'ocean' || this.soundscape === 'rain') {
+      const noiseSrc = ctx.createBufferSource();
+      noiseSrc.buffer = this.createNoiseBuffer(ctx, this.soundscape === 'rain');
+      noiseSrc.loop = true;
+
+      if (this.soundscape === 'rain') {
+        filter.frequency.setValueAtTime(950, now);
+      }
+
+      noiseSrc.connect(filter);
+      noiseSrc.start(now);
+      stopCallbacks.push(() => {
+        try {
+          noiseSrc.stop();
+          noiseSrc.disconnect();
+        } catch {
+          // Ignore
+        }
+      });
+    } else if (this.soundscape === 'drone') {
+      const freqs = [136.1, 204.15, 272.2];
+      freqs.forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const oscGain = ctx.createGain();
+        osc.type = idx === 0 ? 'sine' : 'triangle';
+        osc.frequency.setValueAtTime(freq, now);
+        oscGain.gain.setValueAtTime(idx === 0 ? 0.35 : 0.14, now);
+        osc.connect(oscGain);
+        oscGain.connect(filter);
+        osc.start(now);
+        stopCallbacks.push(() => {
+          try {
+            osc.stop();
+            osc.disconnect();
+          } catch {
+            // Ignore
+          }
+        });
+      });
+    }
+
+    this.ambientGraph = {
+      soundscape: this.soundscape,
+      masterGain,
+      filter,
+      stopNodes: () => {
+        stopCallbacks.forEach((fn) => fn());
+        try {
+          masterGain.disconnect();
+          filter.disconnect();
+        } catch {
+          // Ignore
+        }
+      },
+    };
+  }
+
+  public updateAmbientState(phase: BreathPhase, progress: number): void {
+    const graph = this.ambientGraph;
+    const ctx = this.ctx;
+    if (!graph || !ctx || ctx.state !== 'running') return;
+
+    const target = getAmbientPhaseTarget(phase, progress);
+    const now = ctx.currentTime;
+    const targetGain = Math.max(0.0001, this.volumes.ambientVolume * 0.26 * target.gainMultiplier);
+    const targetFreq = graph.soundscape === 'rain' ? target.filterHz * 1.6 : target.filterHz;
+
+    graph.masterGain.gain.setTargetAtTime(targetGain, now, 0.14);
+    graph.filter.frequency.setTargetAtTime(targetFreq, now, 0.14);
+  }
+
+  public stopAmbient(): void {
+    if (!this.ambientGraph) return;
+    const graph = this.ambientGraph;
+    this.ambientGraph = null;
+    const ctx = this.ctx;
+    if (ctx && ctx.state === 'running') {
+      try {
+        graph.masterGain.gain.setTargetAtTime(0.0001, ctx.currentTime, 0.08);
+        window.setTimeout(() => graph.stopNodes(), 220);
+        return;
+      } catch {
+        // Fall through to immediate cleanup
+      }
+    }
+    graph.stopNodes();
+  }
+
+  public async previewSoundscapeBriefly(): Promise<void> {
+    await this.unlock();
+    if (this.soundscape === 'off') {
+      this.stopAmbient();
+      return;
+    }
+    this.startAmbient();
+  }
+
   private getPlaybackUrl(fileId: string): string | undefined {
-    // Prefer direct local static URL when present for instant streaming in HTMLAudioElement
     return this.localUrls.get(fileId) ?? this.fallbackBlobUrls.get(fileId);
   }
 
@@ -384,13 +726,11 @@ class BreathAudioEngine {
     const ctx = this.getOrCreateContextOnGesture();
     const decodedSync = this.decodedBuffers.get(fileId);
 
-    // Fast synchronous Web Audio path when already decoded and running
     if (ctx && ctx.state === 'running' && decodedSync) {
       this.startPreviewWebAudio(ctx, decodedSync, onEnded);
       return;
     }
 
-    // Synchronous HTMLAudioElement path right inside the click handler for instant gesture-safe playback
     const directUrl = this.getPlaybackUrl(fileId);
     if (directUrl && typeof Audio !== 'undefined') {
       void this.unlock();
@@ -415,11 +755,8 @@ class BreathAudioEngine {
     onEnded?: () => void
   ): void {
     const src = ctx.createBufferSource();
-    const gain = ctx.createGain();
-    gain.gain.setValueAtTime(1.4, ctx.currentTime);
     src.buffer = decoded;
-    src.connect(gain);
-    gain.connect(this.getDestinationNode(ctx));
+    src.connect(this.getVoiceBus(ctx));
     src.onended = () => {
       if (this.previewSource === src) {
         this.previewSource = null;
@@ -432,7 +769,7 @@ class BreathAudioEngine {
 
   private async playPreviewHtmlAudio(url: string, onEnded?: () => void): Promise<void> {
     const audio = new Audio(url);
-    audio.volume = 1.0;
+    audio.volume = this.volumes.voiceVolume;
     this.previewHtmlAudio = audio;
     audio.addEventListener('ended', () => {
       if (this.previewHtmlAudio === audio) this.previewHtmlAudio = null;
@@ -482,6 +819,14 @@ class BreathAudioEngine {
     await playAt(0);
   }
 
+  public async playSafetyStopCue(): Promise<void> {
+    if (!this.enabled || this.mode === 'chimes_only') return;
+    const stopClip = this.safetyIds[1] ?? this.encouragementFileIds[5];
+    if (stopClip && this.hasClipData(stopClip)) {
+      this.playClipById(stopClip);
+    }
+  }
+
   private async previewClipSingle(fileId: string, onEnded?: () => void): Promise<void> {
     const ctx = this.getOrCreateContextOnGesture();
     const decodedSync = this.decodedBuffers.get(fileId);
@@ -507,41 +852,58 @@ class BreathAudioEngine {
     onEnded?.();
   }
 
-  public async testAudioOutput(): Promise<void> {
+  /**
+   * Audio readiness verification: plays verification chime first, waits cleanly until settled,
+   * then plays the voice greeting with zero overlap.
+   */
+  public async runAudioReadinessCheck(): Promise<AudioReadinessReport> {
     await this.unlock();
     const ctx = this.getOrCreateContextOnGesture();
     if (!ctx) {
       throw new Error('Web Audio is unavailable in this browser.');
     }
 
+    this.clearScheduledVoice();
     const now = ctx.currentTime;
-    this.playBellChime(ctx, 440, 0.9, 0.24, now);
-    this.playBellChime(ctx, 554.37, 1.1, 0.18, now + 0.14);
+    const chimeDuration = 0.55;
+    const chimePlayed = this.volumes.chimeVolume > 0;
+    if (chimePlayed) {
+      this.playBellChime(ctx, 440, chimeDuration, 0.24, now);
+    }
+    const voiceDelayMs = chimePlayed ? 620 : 20;
 
-    if (this.mode !== 'chimes_only') {
+    if (this.mode !== 'chimes_only' && this.volumes.voiceVolume > 0) {
       const welcomeClip = this.welcomeIds[0] ?? this.phaseFileIds.inhale;
       if (welcomeClip && this.hasClipData(welcomeClip)) {
         const decoded = await this.ensureDecodedBuffer(welcomeClip);
         if (decoded && ctx.state === 'running') {
           this.stopActiveVoice();
           const src = ctx.createBufferSource();
-          const gain = ctx.createGain();
-          gain.gain.setValueAtTime(1.4, ctx.currentTime);
           src.buffer = decoded;
-          src.connect(gain);
-          gain.connect(this.getDestinationNode(ctx));
+          src.connect(this.getVoiceBus(ctx));
           src.onended = () => {
             if (this.activeSource === src) this.activeSource = null;
           };
           this.activeSource = src;
-          src.start(ctx.currentTime + 0.22);
-          return;
+          // Start strictly after chime settles so voice and chime never overlap
+          const startAt = chimePlayed
+            ? Math.max(ctx.currentTime + 0.05, now + chimeDuration + 0.08)
+            : ctx.currentTime + 0.02;
+          src.start(startAt);
+          return this.getReadinessReport();
         }
 
         const directUrl = this.getPlaybackUrl(welcomeClip);
         if (directUrl && typeof Audio !== 'undefined') {
-          await this.playPreviewHtmlAudio(directUrl);
-          return;
+          await new Promise<void>((resolve) => {
+            this.pendingCheckResolve = resolve;
+            this.scheduledVoiceTimer = window.setTimeout(() => {
+              this.scheduledVoiceTimer = null;
+              this.pendingCheckResolve = null;
+              void this.playPreviewHtmlAudio(directUrl).finally(resolve);
+            }, voiceDelayMs);
+          });
+          return this.getReadinessReport();
         }
       }
 
@@ -550,72 +912,109 @@ class BreathAudioEngine {
         typeof window !== 'undefined' &&
         'speechSynthesis' in window
       ) {
-        this.speakText("Audio ready. Let's breathe together.");
+        this.scheduledVoiceTimer = window.setTimeout(() => {
+          this.scheduledVoiceTimer = null;
+          this.speakText('Audio ready.');
+        }, voiceDelayMs);
       }
     }
+
+    return this.getReadinessReport();
   }
 
-  private playClipById(fileId: string): boolean {
-    const ctx = this.getOrCreateContextOnGesture();
-    const decoded = this.decodedBuffers.get(fileId);
+  public async testAudioOutput(): Promise<void> {
+    await this.runAudioReadinessCheck();
+  }
 
-    // Only use Web Audio BufferSource when AudioContext is actively 'running'.
-    // Otherwise fall back to HTMLAudioElement so audio plays immediately in user gestures.
-    if (ctx && ctx.state === 'running' && decoded) {
-      try {
-        this.stopActiveVoice();
-        const src = ctx.createBufferSource();
-        const gain = ctx.createGain();
-        gain.gain.setValueAtTime(1.4, ctx.currentTime);
-        src.buffer = decoded;
-        src.connect(gain);
-        gain.connect(this.getDestinationNode(ctx));
-        src.onended = () => {
-          if (this.activeSource === src) {
-            this.activeSource = null;
-          }
-        };
-        this.activeSource = src;
-        src.start(0);
-        return true;
-      } catch {
-        // Fall through to HTMLAudioElement
+  private playClipById(fileId: string, delayMs = 0): boolean {
+    if (this.volumes.voiceVolume <= 0) return false;
+
+    const triggerNow = (): boolean => {
+      const ctx = this.getOrCreateContextOnGesture();
+      const decoded = this.decodedBuffers.get(fileId);
+
+      if (ctx && ctx.state === 'running' && decoded) {
+        try {
+          this.stopActiveVoice();
+          const src = ctx.createBufferSource();
+          src.buffer = decoded;
+          src.connect(this.getVoiceBus(ctx));
+          src.onended = () => {
+            if (this.activeSource === src) {
+              this.activeSource = null;
+            }
+          };
+          this.activeSource = src;
+          src.start(0);
+          return true;
+        } catch {
+          // Fall through to HTMLAudioElement
+        }
       }
-    }
 
-    if (ctx && !decoded && this.rawBuffers.has(fileId)) {
-      void this.ensureDecodedBuffer(fileId);
-    }
-
-    const playbackUrl = this.getPlaybackUrl(fileId);
-    if (playbackUrl && typeof Audio !== 'undefined') {
-      try {
-        this.stopActiveVoice();
-        const audio = new Audio(playbackUrl);
-        audio.volume = 1.0;
-        this.activeHtmlAudio = audio;
-        audio.addEventListener('ended', () => {
-          if (this.activeHtmlAudio === audio) this.activeHtmlAudio = null;
-        });
-        audio.play().catch((err) => {
-          if (this.activeHtmlAudio === audio) this.activeHtmlAudio = null;
-          if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) {
-            this.onPlaybackError?.(
-              'Browser blocked audio playback. Click Test Audio or unmute this preview tab.'
-            );
-          }
-        });
-        return true;
-      } catch {
-        return false;
+      if (ctx && !decoded && this.rawBuffers.has(fileId)) {
+        void this.ensureDecodedBuffer(fileId);
       }
+
+      const playbackUrl = this.getPlaybackUrl(fileId);
+      if (playbackUrl && typeof Audio !== 'undefined') {
+        try {
+          this.stopActiveVoice();
+          const audio = new Audio(playbackUrl);
+          audio.volume = this.volumes.voiceVolume;
+          this.activeHtmlAudio = audio;
+          audio.addEventListener('ended', () => {
+            if (this.activeHtmlAudio === audio) this.activeHtmlAudio = null;
+          });
+          audio.play().catch((err) => {
+            if (this.activeHtmlAudio === audio) this.activeHtmlAudio = null;
+            if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) {
+              this.onPlaybackError?.(
+                'Browser blocked audio playback. Run Audio Check or unmute this tab.'
+              );
+            }
+          });
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
+      return false;
+    };
+
+    if (delayMs > 0 && typeof window !== 'undefined') {
+      const ctx = this.ctx;
+      const decoded = this.decodedBuffers.get(fileId);
+      if (ctx && ctx.state === 'running' && decoded) {
+        try {
+          this.stopActiveVoice();
+          const src = ctx.createBufferSource();
+          src.buffer = decoded;
+          src.connect(this.getVoiceBus(ctx));
+          src.onended = () => {
+            if (this.activeSource === src) this.activeSource = null;
+          };
+          this.activeSource = src;
+          src.start(ctx.currentTime + delayMs / 1000);
+          return true;
+        } catch {
+          // Fallback to timeout below
+        }
+      }
+      this.clearScheduledVoice();
+      this.scheduledVoiceTimer = window.setTimeout(() => {
+        this.scheduledVoiceTimer = null;
+        triggerNow();
+      }, delayMs);
+      return true;
     }
 
-    return false;
+    return triggerNow();
   }
 
   private speakText(text: string): boolean {
-    if (!this.speechFallbackEnabled || !text) return false;
+    if (!this.speechFallbackEnabled || !text || this.volumes.voiceVolume <= 0) return false;
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) return false;
 
     try {
@@ -623,7 +1022,7 @@ class BreathAudioEngine {
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.rate = 0.94;
       utterance.pitch = 0.96;
-      utterance.volume = 0.95;
+      utterance.volume = this.volumes.voiceVolume;
       window.speechSynthesis.speak(utterance);
       return true;
     } catch {
@@ -633,10 +1032,9 @@ class BreathAudioEngine {
 
   private speakFallbackCue(
     phase: BreathPhase,
-    breathNumber?: number,
     customSpeechText?: string
   ): boolean {
-    const text = customSpeechText ?? getSpeechCueText(phase, breathNumber);
+    const text = customSpeechText ?? getSpeechCueText(phase);
     return this.speakText(text);
   }
 
@@ -649,11 +1047,17 @@ class BreathAudioEngine {
     const currentRound = context?.currentRound ?? 1;
     const totalRounds = context?.totalRounds ?? 1;
 
+    if (phase === 'preparing') {
+      const prepId = this.welcomeIds[1] ?? this.welcomeIds[0];
+      return { clipId: prepId };
+    }
+
     if (phase === 'inhale' && breathNumber !== undefined) {
       const countFileId = this.countFileIds[breathNumber];
       if (countFileId) return { clipId: countFileId };
 
       if (
+        this.narrationLevel === 'active' &&
         this.progressUpdatesEnabled &&
         totalBreaths >= 8 &&
         breathNumber === totalBreaths - 2 &&
@@ -673,6 +1077,7 @@ class BreathAudioEngine {
       const isHalf = totalBreaths >= 10 && breathNumber === Math.ceil(totalBreaths / 2);
 
       if (
+        this.narrationLevel === 'active' &&
         this.progressUpdatesEnabled &&
         (isQuarter || isHalf) &&
         this.encouragementFileIds.length > 0
@@ -757,46 +1162,75 @@ class BreathAudioEngine {
     phase: BreathPhase,
     breathNumber?: number,
     customSpeechText?: string,
-    context?: { totalBreaths?: number; currentRound?: number; totalRounds?: number }
+    context?: {
+      totalBreaths?: number;
+      currentRound?: number;
+      totalRounds?: number;
+      phaseDurationMs?: number;
+    }
   ): void {
     if (!this.enabled || phase === 'idle') return;
 
-    const allowVoice = this.mode === 'voice_and_chimes' || this.mode === 'voice_only';
-    const allowChime = this.mode === 'voice_and_chimes' || this.mode === 'chimes_only';
+    const hasVoiceForPhase = shouldPlayVoiceForPhase(
+      this.narrationLevel,
+      phase,
+      breathNumber,
+      context?.totalBreaths
+    );
 
-    let playedDriveClip = false;
-    let skippedForProtection = false;
+    const resolved = this.resolvePhaseClipId(phase, breathNumber, context);
+    const skippedForProtection = Boolean(resolved.skippedForProtection);
+    const hasClip = Boolean(resolved.clipId && this.hasClipData(resolved.clipId));
+    const canSpeechFallback =
+      this.speechFallbackEnabled &&
+      typeof window !== 'undefined' &&
+      'speechSynthesis' in window;
 
-    if (allowVoice) {
-      const resolved = this.resolvePhaseClipId(phase, breathNumber, context);
-      skippedForProtection = Boolean(resolved.skippedForProtection);
+    const schedule = resolveCueSchedule({
+      mode: this.mode,
+      phase,
+      hasVoiceForPhase: hasVoiceForPhase && !skippedForProtection,
+      hasVoiceAssetOrSpeech: hasClip || canSpeechFallback,
+      phaseDurationMs: context?.phaseDurationMs ?? 3000,
+    });
 
-      if (!skippedForProtection && resolved.clipId && this.hasClipData(resolved.clipId)) {
-        playedDriveClip = this.playClipById(resolved.clipId);
-        if (playedDriveClip && resolved.protectMs) {
-          this.protectedUntilMs = Date.now() + resolved.protectMs;
+    if (schedule.playChime && this.volumes.chimeVolume > 0) {
+      this.playSynthesizedCue(phase, schedule.playVoice);
+    }
+
+    if (schedule.playVoice && !skippedForProtection && this.volumes.voiceVolume > 0) {
+      if (hasClip && resolved.clipId) {
+        const played = this.playClipById(resolved.clipId, schedule.voiceDelayMs);
+        if (played && resolved.protectMs) {
+          this.protectedUntilMs = Date.now() + resolved.protectMs + schedule.voiceDelayMs;
+        }
+      } else if (canSpeechFallback) {
+        const speechText = this.progressUpdatesEnabled ? customSpeechText : undefined;
+        if (schedule.voiceDelayMs > 0 && typeof window !== 'undefined') {
+          this.clearScheduledVoice();
+          this.scheduledVoiceTimer = window.setTimeout(() => {
+            this.scheduledVoiceTimer = null;
+            this.speakFallbackCue(phase, speechText);
+          }, schedule.voiceDelayMs);
+        } else {
+          this.speakFallbackCue(phase, speechText);
         }
       }
-    }
-
-    if (!playedDriveClip && !skippedForProtection && allowVoice) {
-      const speechText = this.progressUpdatesEnabled ? customSpeechText : undefined;
-      this.speakFallbackCue(phase, breathNumber, speechText);
-    }
-
-    if (allowChime && (!playedDriveClip || this.mode === 'chimes_only')) {
-      this.playSynthesizedCue(phase);
     }
   }
 
   public playProgressUpdate(text: string, tone: 'milestone' | 'countdown' = 'milestone'): void {
     if (!this.enabled || !this.progressUpdatesEnabled) return;
 
-    const allowVoice = this.mode === 'voice_and_chimes' || this.mode === 'voice_only';
-    const allowChime = this.mode === 'voice_and_chimes' || this.mode === 'chimes_only';
+    const allowVoice =
+      (this.mode === 'voice_and_chimes' || this.mode === 'voice_only') &&
+      this.volumes.voiceVolume > 0;
+    const allowChime =
+      (this.mode === 'voice_and_chimes' || this.mode === 'chimes_only') &&
+      this.volumes.chimeVolume > 0;
 
-    let playedDriveClip = false;
-    if (allowVoice && tone === 'milestone') {
+    let playedClip = false;
+    if (allowVoice && tone === 'milestone' && this.narrationLevel === 'active') {
       const pool = [...this.encouragementFileIds, ...this.holdPoolIds.slice(1)].filter((id) =>
         this.hasClipData(id)
       );
@@ -805,19 +1239,21 @@ class BreathAudioEngine {
         const chosenId = pool[(this.encouragementCursor + this.holdCursor) % pool.length];
         this.encouragementCursor += 1;
         this.holdCursor += 1;
-        playedDriveClip = this.playClipById(chosenId);
+        playedClip = this.playClipById(chosenId);
       }
     }
 
+    let spokeText = false;
     if (
-      !playedDriveClip &&
+      !playedClip &&
       allowVoice &&
-      (tone === 'countdown' || this.encouragementFileIds.length === 0)
+      (tone === 'countdown' || this.encouragementFileIds.length === 0 || this.narrationLevel === 'balanced')
     ) {
-      this.speakText(text);
+      spokeText = this.speakText(text);
     }
 
-    if (allowChime && (!playedDriveClip || this.mode === 'chimes_only')) {
+    // Never play a simultaneous chime over voice or speechSynthesis
+    if (allowChime && !playedClip && !spokeText) {
       const ctx = this.getOrCreateContextOnGesture();
       if (ctx && ctx.state === 'running') {
         try {
@@ -825,40 +1261,46 @@ class BreathAudioEngine {
           if (tone === 'countdown') {
             this.playSoftTone(ctx, 523.25, 587.33, 0.35, 0.14, now);
           } else {
-            this.playBellChime(ctx, 528, 1.1, 0.14, now);
+            this.playBellChime(ctx, 528, 0.9, 0.14, now);
           }
         } catch {
-          // Ignore audio failures in restricted environments
+          // Ignore audio failures
         }
       }
     }
   }
 
-  private playSynthesizedCue(phase: BreathPhase): void {
+  private playSynthesizedCue(phase: BreathPhase, compact = false): void {
     const ctx = this.getOrCreateContextOnGesture();
-    if (!ctx) return;
+    if (!ctx || this.volumes.chimeVolume <= 0) return;
+
+    const durScale = compact ? 0.42 : 1.0;
 
     const trigger = () => {
       try {
         const now = ctx.currentTime;
-        if (phase === 'inhale') {
-          this.playSoftTone(ctx, 293.66, 392.0, 0.45, 0.2, now);
+        if (phase === 'preparing') {
+          this.playBellChime(ctx, 392.0, 0.8 * durScale, 0.16, now);
+        } else if (phase === 'inhale') {
+          this.playSoftTone(ctx, 293.66, 392.0, 0.45 * durScale, 0.2, now);
         } else if (phase === 'exhale') {
-          this.playSoftTone(ctx, 349.23, 246.94, 0.5, 0.18, now);
+          this.playSoftTone(ctx, 349.23, 246.94, 0.5 * durScale, 0.18, now);
         } else if (phase === 'hold') {
-          this.playBellChime(ctx, 220, 2.0, 0.26, now);
+          this.playBellChime(ctx, 220, compact ? 0.34 : 1.6, 0.24, now);
         } else if (phase === 'recovery_inhale') {
-          this.playBellChime(ctx, 440, 1.6, 0.26, now);
+          this.playBellChime(ctx, 440, compact ? 0.34 : 1.4, 0.24, now);
         } else if (phase === 'recovery_hold') {
-          this.playSoftTone(ctx, 523.25, 523.25, 0.7, 0.16, now);
+          this.playSoftTone(ctx, 523.25, 523.25, 0.55 * durScale, 0.16, now);
         } else if (phase === 'recovery_exhale') {
-          this.playSoftTone(ctx, 392.0, 261.63, 0.9, 0.18, now);
+          this.playSoftTone(ctx, 392.0, 261.63, compact ? 0.34 : 0.8, 0.18, now);
         } else if (phase === 'completed') {
-          this.playBellChime(ctx, 329.63, 2.2, 0.24, now);
-          this.playBellChime(ctx, 440, 2.4, 0.22, now + 0.16);
+          this.playBellChime(ctx, 329.63, compact ? 0.34 : 1.8, 0.22, now);
+          if (!compact) {
+            this.playBellChime(ctx, 440, 2.0, 0.2, now + 0.16);
+          }
         }
       } catch {
-        // Ignore audio failures in restricted environments
+        // Ignore audio failures
       }
     };
 
@@ -887,11 +1329,11 @@ class BreathAudioEngine {
     osc.frequency.exponentialRampToValueAtTime(Math.max(40, endFreq), startTime + durationSec);
 
     gain.gain.setValueAtTime(0.0001, startTime);
-    gain.gain.linearRampToValueAtTime(peakGain, startTime + 0.05);
+    gain.gain.linearRampToValueAtTime(peakGain, startTime + 0.04);
     gain.gain.exponentialRampToValueAtTime(0.0001, startTime + durationSec);
 
     osc.connect(gain);
-    gain.connect(this.getDestinationNode(ctx));
+    gain.connect(this.getChimeBus(ctx));
     osc.start(startTime);
     osc.stop(startTime + durationSec + 0.02);
   }
@@ -915,16 +1357,16 @@ class BreathAudioEngine {
     overtone.frequency.setValueAtTime(freq * 2, startTime);
 
     gain.gain.setValueAtTime(0.0001, startTime);
-    gain.gain.linearRampToValueAtTime(peakGain, startTime + 0.03);
+    gain.gain.linearRampToValueAtTime(peakGain, startTime + 0.025);
     gain.gain.exponentialRampToValueAtTime(0.0001, startTime + durationSec);
 
     overtoneGain.gain.setValueAtTime(0.0001, startTime);
-    overtoneGain.gain.linearRampToValueAtTime(peakGain * 0.28, startTime + 0.02);
+    overtoneGain.gain.linearRampToValueAtTime(peakGain * 0.26, startTime + 0.02);
     overtoneGain.gain.exponentialRampToValueAtTime(0.0001, startTime + durationSec * 0.65);
 
     osc.connect(gain);
     overtone.connect(overtoneGain);
-    const dest = this.getDestinationNode(ctx);
+    const dest = this.getChimeBus(ctx);
     gain.connect(dest);
     overtoneGain.connect(dest);
 
